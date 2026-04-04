@@ -1,0 +1,72 @@
+# .github/workflows/jmeter_perf.yml
+name: Performance Test
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:               # 支持手动触发
+    inputs:
+      threads:
+        description: '并发线程数'
+        default: '10'
+      duration:
+        description: '执行时长（秒）'
+        default: '60'
+
+jobs:
+  perf-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Install JMeter
+        run: |
+          wget -q https://downloads.apache.org/jmeter/binaries/apache-jmeter-5.6.3.tgz
+          tar -xzf apache-jmeter-5.6.3.tgz
+          echo "$PWD/apache-jmeter-5.6.3/bin" >> $GITHUB_PATH
+                                   # 加入 PATH，后续步骤直接用 jmeter 命令
+
+      - name: Run Performance Test
+        env:
+          THREADS: ${{ github.event.inputs.threads || '10' }}
+          DURATION: ${{ github.event.inputs.duration || '60' }}
+          BUILD_ID: ${{ github.run_number }}
+        run: |
+          chmod +x tests/scripts/run_jmeter.sh
+          ./tests/scripts/run_jmeter.sh login_test
+
+      - name: Check Error Rate
+        run: |
+          JTL="results/jtl/login_test_${{ github.run_number }}.jtl"
+          TOTAL=$(tail -n +2 "$JTL" | wc -l)
+          FAILED=$(tail -n +2 "$JTL" | awk -F',' '$8=="false"' | wc -l)
+          RATE=$(echo "scale=4; $FAILED / $TOTAL" | bc)
+          echo "总请求: $TOTAL，失败: $FAILED，错误率: $RATE"
+          if (( $(echo "$RATE > 0.01" | bc -l) )); then
+            echo "错误率超过 1%，构建失败"
+            exit 1
+          fi
+
+      - name: Upload Report
+        if: always()               # 无论成功失败都上传报告，方便排查
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-report-${{ github.run_number }}
+          path: results/report/
+          retention-days: 30       # 保留 30 天
+
+      - name: Upload JTL
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jtl-${{ github.run_number }}
+          path: results/jtl/
+          retention-days: 90       # jtl 保留更长，支持后续分析

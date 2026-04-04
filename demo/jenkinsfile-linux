@@ -1,0 +1,194 @@
+pipeline {
+    agent {
+        label 'linux_label'
+    }
+
+    // 配置触发器 - 代码更新后自动触发
+    triggers {
+        // 轮询 SCM，检查代码变更（每2分钟检查一次，错开Windows流水线的触发时间）
+        pollSCM('1-59/2 * * * *')
+    }
+
+    // 定义可配置的参数
+    parameters {
+        // 分支选择参数
+        gitParameter(
+            branch: '',
+            name: 'BRANCH',
+            description: '选择要测试的分支',
+            type: 'PT_BRANCH',
+            defaultValue: 'main',
+            selectedValue: 'DEFAULT',
+            sortMode: 'ASCENDING_SMART',
+            quickFilterEnabled: true
+        )
+
+        // 测试目标参数 - 默认为所有单元测试
+        string(
+            name: 'TEST_TARGET',
+            defaultValue: 'tests/',
+            description: '测试目标路径（默认为 tests/ 目录下所有测试；也可以指定具体文件或测试用例）'
+        )
+    }
+
+    stages {
+        stage('Platform Detection') {
+            steps {
+                script {
+                    echo "=== Linux Platform Pipeline ==="
+                    echo "Node name: ${env.NODE_NAME}"
+                    echo "Node labels: ${env.NODE_LABELS}"
+
+                    env.CURRENT_PLATFORM = 'linux'
+                    echo "Target platform: ${env.CURRENT_PLATFORM}"
+                }
+            }
+        }
+
+        stage('Get Git Info') {
+            steps {
+                script {
+                    def gitCommit = ""
+                    def gitMessage = ""
+                    try {
+                        echo "Getting Git info on Linux/Unix system"
+                        gitCommit = sh(returnStdout: true, script: 'git rev-parse HEAD').trim()
+                        gitMessage = sh(returnStdout: true, script: 'git log -1 --pretty=format:"%s"').trim()
+
+                        echo "Current commit: ${gitCommit}"
+                        echo "Commit message: ${gitMessage}"
+                    } catch (Exception e) {
+                        echo "Failed to get Git information: ${e.message}"
+                        gitCommit = "unknown"
+                        gitMessage = "No commit message"
+                    }
+
+                    env.GIT_COMMIT_SHORT = gitCommit.length() > 7 ? gitCommit.take(7) : gitCommit
+                    env.GIT_COMMIT_MESSAGE = gitMessage
+                }
+            }
+        }
+
+        stage('Set Build Name') {
+            steps {
+                script {
+                    def user = currentBuild.rawBuild.getCause(hudson.model.Cause$UserIdCause)?.userId ?: "Auto-Trigger"
+                    echo "Triggered by user: ${user}"
+
+                    def branch_name = params.BRANCH ?: (env.GIT_BRANCH ? env.GIT_BRANCH.split('/').last() : 'main')
+                    if (params.BRANCH) {
+                        // 对于 gitParameter，通常已经是最简单的分支名
+                        branch_name = params.BRANCH
+                        // 如果是 refs/heads/ 形式，需要进一步处理
+                        if (branch_name.startsWith('refs/heads/')) {
+                            branch_name = branch_name.substring(11)
+                        }
+                    } else if (env.GIT_BRANCH) {
+                        // 对于环境变量，移除远程仓库前缀
+                        def branchParts = env.GIT_BRANCH.split('/')
+                        branch_name = branchParts[-1] // 取最后一个元素
+                    }
+
+                    currentBuild.displayName = "#${BUILD_NUMBER}-Linux-${branch_name}-${env.GIT_COMMIT_SHORT}-${user}"
+                    currentBuild.description = "Platform: Linux | Branch: ${branch_name} | Commit: ${env.GIT_COMMIT_MESSAGE}"
+
+                    echo "Branch: ${branch_name}"
+                    echo "Platform: Linux"
+                    echo "Trigger method: ${user}"
+                }
+            }
+        }
+
+        stage('Setup Linux Environment') {
+            steps {
+                script {
+                    echo "=== Setting up Linux environment ==="
+
+                    sh '''
+                        echo "=== Conda Environment Setup ==="
+                        eval "$(conda shell.bash hook 2>/dev/null)" > /dev/null
+                        conda activate env3.10
+                        echo "Python: $(which python) ($(python --version))"
+                        [ -d "tests" ] && echo "tests directory ready" || echo "tests directory missing"
+                    '''
+                }
+            }
+        }
+
+        stage('Run Unit Tests on Linux') {
+            steps {
+                script {
+                    echo "=== Running unit tests on Linux ==="
+
+                    sh '''
+                        echo "Cleaning previous test results..."
+                        rm -rf allure-results
+                        mkdir -p allure-results
+                    '''
+
+                    def reportCommand = "--alluredir=allure-results"
+
+                    try {
+                        sh '''
+                            echo "Starting unit tests on Linux..."
+                            echo "Test target: ''' + params.TEST_TARGET + '''"
+                            eval "$(conda shell.bash hook 2>/dev/null)" > /dev/null
+                            conda activate env3.10
+                            python -m pytest ''' + params.TEST_TARGET + ''' -v -s ''' + reportCommand + '''
+                        '''
+
+                        currentBuild.result = 'SUCCESS'
+                        echo "Unit tests executed successfully on Linux!"
+
+                    } catch (Exception e) {
+                        currentBuild.result = 'UNSTABLE'
+                        echo "Unit tests have failed test cases on Linux: ${e.message}"
+                        // 即使测试失败，也继续执行后续步骤以生成报告
+                    }
+                }
+            }
+            post {
+                always {
+                    script {
+                        // 发布测试报告
+                        if (fileExists('allure-results')) {
+                            allure results: [[path: 'allure-results']]
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    options {
+        // 保留构建日志的策略
+        buildDiscarder(logRotator(numToKeepStr: '100', artifactNumToKeepStr: '50'))
+        // 超时处理
+        timeout(time: 60, unit: 'MINUTES')
+        // 跳过默认的 checkout
+        skipDefaultCheckout(false)
+        // 时间戳
+        timestamps()
+    }
+
+    // 构建后通知
+    post {
+        success {
+            echo "Linux unit tests executed successfully! All test cases passed."
+        }
+        unstable {
+            echo "Linux unit tests completed, but some test cases failed. Please check the test report."
+        }
+        failure {
+            echo "Linux unit test execution failed. Please check build logs and test reports."
+        }
+        always {
+            echo "Linux build completed, cleaning up temporary files..."
+            sh '''
+                if [ -f activate_path.txt ]; then
+                    rm activate_path.txt
+                fi
+            '''
+        }
+    }
+}

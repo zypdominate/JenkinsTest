@@ -1,0 +1,78 @@
+pipeline {
+    agent {
+        label 'linux_label'
+    }
+
+  parameters {
+    string(name: 'THREADS',  defaultValue: '20',  description: '并发线程数')
+    string(name: 'DURATION', defaultValue: '120', description: '执行时长（秒）')
+    choice(name: 'SCRIPT',   choices: ['login_test', 'flow_test'], description: '测试场景')
+  }
+
+  environment {
+    JMETER_HOME = '/home/magnolia/tools/apache/jmeter'
+    BUILD_ID    = "${env.BUILD_NUMBER}"
+  }
+
+  stages {
+    stage('Prepare') {
+      steps {
+        sh '''
+          mkdir -p results/jtl results/report/${BUILD_ID}
+        '''
+      }
+    }
+
+    stage('Run JMeter') {
+      steps {
+        sh '''
+          ${JMETER_HOME}/bin/jmeter -n \
+            -t tests/${SCRIPT}.jmx \
+            -l results/jtl/${SCRIPT}_${BUILD_ID}.jtl \
+            -j results/${SCRIPT}_${BUILD_ID}.log \
+            -e -o results/report/${BUILD_ID} \
+            -JBASE_URL=${BASE_URL} \
+            -JTHREADS=${THREADS} \
+            -JDURATION=${DURATION} \
+            -JDATA_DIR=tests/data \
+            -X
+        '''
+      }
+    }
+
+    stage('Check Threshold') {
+      steps {
+        script {
+          def jtl  = "results/jtl/${params.SCRIPT}_${env.BUILD_NUMBER}.jtl"
+          def total  = sh(script: "tail -n +2 ${jtl} | wc -l", returnStdout: true).trim().toInteger()
+          def failed = sh(script: "tail -n +2 ${jtl} | awk -F',' '\$8==\"false\"' | wc -l", returnStdout: true).trim().toInteger()
+          def rate   = failed / total
+
+          echo "总请求: ${total}，失败: ${failed}，错误率: ${rate}"
+
+          if (rate > 0.01) {
+            error("错误率 ${rate} 超过阈值 1%，构建失败")
+          }
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      publishHTML([
+        allowMissing:          false,
+        alwaysLinkToLastBuild: true,
+        keepAll:               true,   // 保留所有构建的报告
+        reportDir:             "results/report/${env.BUILD_NUMBER}",
+        reportFiles:           'index.html',
+        reportName:            'JMeter Report'
+      ])
+
+      archiveArtifacts(
+        artifacts:     'results/jtl/*.jtl',
+        allowEmptyArchive: false
+      )
+    }
+  }
+}
